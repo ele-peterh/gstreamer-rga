@@ -402,8 +402,8 @@ static gboolean gst_rga_video_convert_set_info(GstVideoFilter *filter,
   GstVideoFormat out_format = GST_VIDEO_INFO_FORMAT(out_info);
 
   if (gst_gst_format_to_rga_format(in_format) == RK_FORMAT_UNKNOWN ||
-      gst_gst_format_to_rga_format(in_format) == RK_FORMAT_UNKNOWN) {
-    GST_INFO_OBJECT(filter, "don't support format. in format=%d,out format=%d",
+      gst_gst_format_to_rga_format(out_format) == RK_FORMAT_UNKNOWN) {
+    GST_INFO_OBJECT(rgavideoconvert, "don't support format. in format=%d,out format=%d",
                     in_format, out_format);
     return FALSE;
   }

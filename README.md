@@ -16,6 +16,8 @@ RGA is Rockchip’s on‑chip 2D engine that performs BLIT, resize, rotation and
   - [Quick Start](#quick-start)
   - [Advanced Usage](#advanced-usage)
     - [`core-mask` Property](#core-mask-property)
+    - [`flip` Property](#flip-property)
+    - [`rotation` Property](#rotation-property)
     - [Multiple streams (stress test)](#multiple-streams-stress-test)
   - [Best Practice](#best-practice)
   - [Troubleshooting](#troubleshooting)
@@ -26,6 +28,8 @@ RGA is Rockchip’s on‑chip 2D engine that performs BLIT, resize, rotation and
 
 - **Colours‑space conversion** between NV12/NV21/I420/YV12/… and RGB/BGR/BGRA/RGBA.
 - **Image resizing** up to 8192x8192 input, 4096x4096 output (RGA H/W limit).
+- **Image rotation** by 90, 180 and 270 degrees.
+- **Image flip** horizontal, vertical and both.
 - **Multistream aware** – tested with 6 parallel operations on RK3588.
 - **Runtime core selection** ‑ new `core-mask` property lets you pin jobs to RGA3 or RGA2 cores.
 - **Zero‑copy DMA‑BUF** support when upstream allocators provide dmabuf FDs.
@@ -43,7 +47,7 @@ RGA is Rockchip’s on‑chip 2D engine that performs BLIT, resize, rotation and
 
 ```bash
 # 1. Clone
-$ git clone https://github.com/corenel/gstreamer-rga.git
+$ git clone https://github.com/ele-peterh/gstreamer-rga.git
 $ cd gstreamer-rga
 
 # 2. Configure (default = /usr/local)
@@ -76,7 +80,7 @@ Factory Details:
 Plugin Details:
   Name                     rgavideoconvert
   Description              video Colorspace conversion & scaler
-  Filename                 /usr/lib/aarch64-linux-gnu/gstreamer-1.0/libgstrgavideoconvert.so
+  Filename                 /home/radxa/.local/lib/aarch64-linux-gnu/gstreamer-1.0/libgstrgavideoconvert.so
   Version                  0.1.0
   License                  MIT/X11
   Source module            gst-rga
@@ -96,18 +100,18 @@ Pad Templates:
     Availability: Always
     Capabilities:
       video/x-raw
-                 format: { (string)I420, (string)YV12, (string)NV12, (string)NV21, (string)Y42B, (string)NV16, (string)NV61, (string)RGB16, (string)RGB15, (string)BGR, (string)RGB, (string)BGRA, (string)RGBA, (string)BGRx, (string)RGBx }
-                  width: [ 1, 8192 ]
-                 height: [ 1, 8192 ]
+                 format: { (string)RGBA, (string)BGRA, (string)ARGB, (string)ABGR, (string)RGBx, (string)BGRx, (string)xRGB, (string)xBGR, (string)RGB, (string)BGR, (string)RGB16, (string)NV12, (string)NV21, (string)NV16, (string)NV61, (string)I420, (string)YV12, (string)Y42B, (string)YUY2, (string)YVYU, (string)UYVY, (string)GRAY8 }
+                  width: [ 2, 8192 ]
+                 height: [ 2, 8192 ]
               framerate: [ 0/1, 2147483647/1 ]
 
   SRC template: 'src'
     Availability: Always
     Capabilities:
       video/x-raw
-                 format: { (string)I420, (string)YV12, (string)NV12, (string)NV21, (string)Y42B, (string)NV16, (string)NV61, (string)RGB16, (string)RGB15, (string)BGR, (string)RGB, (string)BGRA, (string)RGBA, (string)BGRx, (string)RGBx }
-                  width: [ 1, 4096 ]
-                 height: [ 1, 4096 ]
+                 format: { (string)RGBA, (string)BGRA, (string)ARGB, (string)ABGR, (string)RGBx, (string)BGRx, (string)xRGB, (string)xBGR, (string)RGB, (string)BGR, (string)RGB16, (string)NV12, (string)NV21, (string)NV16, (string)NV61, (string)I420, (string)YV12, (string)Y42B, (string)YUY2, (string)YVYU, (string)UYVY, (string)GRAY8 }
+                  width: [ 2, 4096 ]
+                 height: [ 2, 4096 ]
               framerate: [ 0/1, 2147483647/1 ]
 
 Element has no clocking capabilities.
@@ -115,7 +119,6 @@ Element has no URI handling capabilities.
 
 Pads:
   SINK: 'sink'
-    Pad Template: 'sink'
     Pad Template: 'sink'
   SRC: 'src'
     Pad Template: 'src'
@@ -132,6 +135,14 @@ Element Properties:
                            (0x00000003): rga3             - rga3
                            (0x00000004): rga2             - rga2
 
+  flip                : Flip the image (none/horizontal/vertical/both)
+                        flags: readable, writable
+                        Enum "GstRgaFlip" Default: 0, "none"
+                           (0): none             - none
+                           (8): horizontal       - horizontal
+                           (16): vertical         - vertical
+                           (32): both             - both
+
   name                : The name of the object
                         flags: readable, writable
                         String. Default: "rgavideoconvert0"
@@ -143,6 +154,16 @@ Element Properties:
   qos                 : Handle Quality-of-Service events
                         flags: readable, writable
                         Boolean. Default: true
+
+  rotation            : Rotate the image (none/90/180/270 degrees)
+                        flags: readable, writable
+                        Enum "GstRgaRotation" Default: 0, "none"
+                           (0): none             - none
+                           (1): 90               - 90
+                           (2): 180              - 180
+                           (4): 270              - 270
+
+
 ```
 
 ## Quick Start
@@ -155,6 +176,11 @@ gst-launch-1.0 videotestsrc ! video/x-raw,width=1920,height=1080,format=NV12 \
 # Pin work to RGA3 only – avoids 32-bit limitation of RGA2
 gst-launch-1.0 filesrc location=test.h264 ! h264parse ! mppvideodec \
   ! rgavideoconvert core-mask=rga3 \
+  ! video/x-raw,width=1280,height=720,format=BGRx ! fakesink
+
+# Rotate and flip
+gst-launch-1.0 filesrc location=test.h264 ! h264parse ! mppvideodec \
+  ! rgavideoconvert rotation=270 flip=both \
   ! video/x-raw,width=1280,height=720,format=BGRx ! fakesink
 ```
 
@@ -174,6 +200,32 @@ The property is a **GFlags** bit‑mask.
 | `rga2_core0`     | single core                                          |                             |
 
 Set it per element: `… ! rgavideoconvert core-mask=rga3 ! …`
+
+### `flip` Property
+
+The property is a **GEnum** value.
+
+| string value    | int | librga constant              | meaning                        |
+| --------------- | --- | ---------------------------- | ------------------------------ |
+| `none` (default)| 0   | —                            | no flip                        |
+| `horizontal`    | 8   | `IM_HAL_TRANSFORM_FLIP_H`    | mirror left↔right              |
+| `vertical`      | 16  | `IM_HAL_TRANSFORM_FLIP_V`    | mirror top↔bottom              |
+| `both`          | 32  | `IM_HAL_TRANSFORM_FLIP_H_V`  | mirror both axes               |
+
+Set it per element: `… ! rgavideoconvert flip=horizontal ! …`
+
+### `rotation` Property
+
+The property is a **GEnum** value.
+
+| string value    | int | librga constant              | meaning              |
+| --------------- | --- | ---------------------------- | -------------------- |
+| `none` (default)| 0   | —                            | no rotation          |
+| `90`            | 1   | `IM_HAL_TRANSFORM_ROT_90`    | rotate 90° CW        |
+| `180`           | 2   | `IM_HAL_TRANSFORM_ROT_180`   | rotate 180°          |
+| `270`           | 4   | `IM_HAL_TRANSFORM_ROT_270`   | rotate 270° CW |
+
+Set it per element: `… ! rgavideoconvert rotation=90 ! …`
 
 ### Multiple streams (stress test)
 

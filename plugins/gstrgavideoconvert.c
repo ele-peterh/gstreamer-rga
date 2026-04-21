@@ -62,6 +62,11 @@ static GstCaps *gst_rga_video_convert_transform_caps(GstBaseTransform *trans,
                                                      GstCaps *caps,
                                                      GstCaps *filter);
 
+static GstCaps *gst_rga_video_convert_fixate_caps(GstBaseTransform *trans,
+                                                   GstPadDirection direction,
+                                                   GstCaps *caps,
+                                                   GstCaps *othercaps);
+
 static gboolean gst_rga_video_convert_set_info(GstVideoFilter *filter,
                                                GstCaps *incaps,
                                                GstVideoInfo *in_info,
@@ -73,24 +78,29 @@ static GstFlowReturn gst_rga_video_convert_transform_frame(
 
 /* pad templates */
 
-#define VIDEO_SRC_CAPS                                                         \
-  "video/x-raw, "                                                              \
-  "format = (string) "                                                         \
-  "{ I420, YV12, NV12, NV21, Y42B, NV16, NV61, RGB16, RGB15, BGR, RGB, BGRA, " \
-  "RGBA, BGRx, RGBx }"                                                         \
-  ", "                                                                         \
-  "width = (int) [ 1, 4096 ] ,"                                                \
-  "height = (int) [ 1, 4096 ] ,"                                               \
+/* RGA3 src does not support planar YUV (I420/YV12/Y42B) or GRAY8.
+ * We advertise the RGA2Enhanced superset here; if RGA3 is selected at
+ * runtime and an unsupported format is negotiated, improcess will error. */
+#define RGA_FORMATS \
+  "{ RGBA, BGRA, ARGB, ABGR, RGBx, BGRx, xRGB, xBGR, " \
+  "RGB, BGR, RGB16, " \
+  "NV12, NV21, NV16, NV61, " \
+  "I420, YV12, Y42B, " \
+  "YUY2, YVYU, UYVY, " \
+  "GRAY8 }"
+
+#define VIDEO_SRC_CAPS \
+  "video/x-raw, " \
+  "format = (string) " RGA_FORMATS ", " \
+  "width = (int) [ 2, 4096 ], " \
+  "height = (int) [ 2, 4096 ], " \
   "framerate = (fraction) [ 0, max ]"
 
-#define VIDEO_SINK_CAPS                                                        \
-  "video/x-raw, "                                                              \
-  "format = (string) "                                                         \
-  "{ I420, YV12, NV12, NV21, Y42B, NV16, NV61, RGB16, RGB15, BGR, RGB, BGRA, " \
-  "RGBA, BGRx, RGBx }"                                                         \
-  ", "                                                                         \
-  "width = (int) [ 1, 8192 ] ,"                                                \
-  "height = (int) [ 1, 8192 ] ,"                                               \
+#define VIDEO_SINK_CAPS \
+  "video/x-raw, " \
+  "format = (string) " RGA_FORMATS ", " \
+  "width = (int) [ 2, 8192 ], " \
+  "height = (int) [ 2, 8192 ], " \
   "framerate = (fraction) [ 0, max ]"
 
 /* element properties */
@@ -98,6 +108,8 @@ static GstFlowReturn gst_rga_video_convert_transform_frame(
 typedef enum {
   GST_RGA_PROP_0,
   GST_RGA_PROP_CORE_MASK,
+  GST_RGA_PROP_FLIP,
+  GST_RGA_PROP_ROTATION,
   GST_RGA_PROP_LAST
 } GstRgaProp;
 
@@ -154,19 +166,45 @@ static void gst_rga_video_convert_class_init(GstRgaVideoConvertClass *klass) {
 
   rga_props[GST_RGA_PROP_CORE_MASK] = g_param_spec_flags(
       "core-mask", "Core mask", "Select which RGA core(s) to use (bit-mask)",
-      mask_type, IM_SCHEDULER_RGA3_DEFAULT, /* default == auto */
+      mask_type, IM_SCHEDULER_RGA3_CORE0 | IM_SCHEDULER_RGA3_CORE1,
       G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+
+  static const GEnumValue flip_values[] = {
+      {0, "none", "none"},
+      {IM_HAL_TRANSFORM_FLIP_H, "horizontal", "horizontal"},
+      {IM_HAL_TRANSFORM_FLIP_V, "vertical", "vertical"},
+      {IM_HAL_TRANSFORM_FLIP_H_V, "both", "both"},
+      {0, NULL, NULL}};
+  GType flip_type = g_enum_register_static("GstRgaFlip", flip_values);
+  rga_props[GST_RGA_PROP_FLIP] = g_param_spec_enum(
+      "flip", "Flip", "Flip the image (none/horizontal/vertical/both)",
+      flip_type, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+
+  static const GEnumValue rotation_values[] = {
+      {0, "none", "none"},
+      {IM_HAL_TRANSFORM_ROT_90, "90", "90"},
+      {IM_HAL_TRANSFORM_ROT_180, "180", "180"},
+      {IM_HAL_TRANSFORM_ROT_270, "270", "270"},
+      {0, NULL, NULL}};
+  GType rotation_type = g_enum_register_static("GstRgaRotation", rotation_values);
+  rga_props[GST_RGA_PROP_ROTATION] = g_param_spec_enum(
+      "rotation", "Rotation", "Rotate the image (none/90/180/270 degrees)",
+      rotation_type, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
 
   gobject_class->set_property = gst_rga_video_convert_set_property;
   gobject_class->get_property = gst_rga_video_convert_get_property;
   g_object_class_install_property(gobject_class, GST_RGA_PROP_CORE_MASK,
                                   rga_props[GST_RGA_PROP_CORE_MASK]);
-
-  base_transform_class->passthrough_on_same_caps = TRUE;
+  g_object_class_install_property(gobject_class, GST_RGA_PROP_FLIP,
+                                  rga_props[GST_RGA_PROP_FLIP]);
+  g_object_class_install_property(gobject_class, GST_RGA_PROP_ROTATION,
+                                  rga_props[GST_RGA_PROP_ROTATION]);
 
   base_transform_class->transform_caps =
       GST_DEBUG_FUNCPTR(gst_rga_video_convert_transform_caps);
 
+  base_transform_class->fixate_caps =
+      GST_DEBUG_FUNCPTR(gst_rga_video_convert_fixate_caps);
   base_transform_class->start = GST_DEBUG_FUNCPTR(gst_rga_video_convert_start);
   base_transform_class->stop = GST_DEBUG_FUNCPTR(gst_rga_video_convert_stop);
   video_filter_class->set_info =
@@ -175,34 +213,79 @@ static void gst_rga_video_convert_class_init(GstRgaVideoConvertClass *klass) {
       GST_DEBUG_FUNCPTR(gst_rga_video_convert_transform_frame);
 }
 
+static GstCaps *gst_rga_video_convert_fixate_caps(GstBaseTransform *trans,
+                                                   GstPadDirection direction,
+                                                   GstCaps *caps,
+                                                   GstCaps *othercaps) {
+  GstStructure *ins = gst_caps_get_structure(caps, 0);
+  GstCaps *result = gst_caps_make_writable(othercaps);
+  GstStructure *outs = gst_caps_get_structure(result, 0);
+  gint w, h;
+  const gchar *fmt;
+
+  if (gst_structure_get_int(ins, "width", &w))
+    gst_structure_fixate_field_nearest_int(outs, "width", w);
+  if (gst_structure_get_int(ins, "height", &h))
+    gst_structure_fixate_field_nearest_int(outs, "height", h);
+  if ((fmt = gst_structure_get_string(ins, "format")))
+    gst_structure_fixate_field_string(outs, "format", fmt);
+
+  return gst_caps_fixate(result);
+}
+
 static RgaSURF_FORMAT gst_gst_format_to_rga_format(GstVideoFormat format) {
   switch (format) {
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_I420, RK_FORMAT_YCbCr_420_P);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_YV12, RK_FORMAT_YCrCb_420_P);
+    /* 32-bit RGBA variants */
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGBA, RK_FORMAT_RGBA_8888);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_BGRA, RK_FORMAT_BGRA_8888);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_ARGB, RK_FORMAT_ARGB_8888);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_ABGR, RK_FORMAT_ABGR_8888);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGBx, RK_FORMAT_RGBX_8888);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_BGRx, RK_FORMAT_BGRX_8888);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_xRGB, RK_FORMAT_XRGB_8888);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_xBGR, RK_FORMAT_XBGR_8888);
+    /* 24-bit RGB */
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGB, RK_FORMAT_RGB_888);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_BGR, RK_FORMAT_BGR_888);
+    /* 16-bit RGB */
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGB16, RK_FORMAT_RGB_565);
+    /* YUV semi-planar */
     GST_CASE_RETURN(GST_VIDEO_FORMAT_NV12, RK_FORMAT_YCbCr_420_SP);
     GST_CASE_RETURN(GST_VIDEO_FORMAT_NV21, RK_FORMAT_YCrCb_420_SP);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_NV16, RK_FORMAT_YCbCr_422_SP);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_NV61, RK_FORMAT_YCrCb_422_SP);
 #ifdef HAVE_NV12_10LE40
     GST_CASE_RETURN(GST_VIDEO_FORMAT_NV12_10LE40, RK_FORMAT_YCbCr_420_SP_10B);
 #endif
+    /* YUV planar (RGA2Enhanced only) */
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_I420, RK_FORMAT_YCbCr_420_P);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_YV12, RK_FORMAT_YCrCb_420_P);
     GST_CASE_RETURN(GST_VIDEO_FORMAT_Y42B, RK_FORMAT_YCbCr_422_P);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_NV16, RK_FORMAT_YCbCr_422_SP);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_NV61, RK_FORMAT_YCrCb_422_SP);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGB16, RK_FORMAT_RGB_565);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGB15, RK_FORMAT_RGBA_5551);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_BGR, RK_FORMAT_BGR_888);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGB, RK_FORMAT_RGB_888);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_BGRA, RK_FORMAT_BGRA_8888);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGBA, RK_FORMAT_RGBA_8888);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_BGRx, RK_FORMAT_BGRX_8888);
-    GST_CASE_RETURN(GST_VIDEO_FORMAT_RGBx, RK_FORMAT_RGBX_8888);
+    /* YUV packed */
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_YUY2, RK_FORMAT_YUYV_422);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_YVYU, RK_FORMAT_YVYU_422);
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_UYVY, RK_FORMAT_UYVY_422);
+    /* Grayscale (RGA2Enhanced only) */
+    GST_CASE_RETURN(GST_VIDEO_FORMAT_GRAY8, RK_FORMAT_YCbCr_400);
     default:
       return RK_FORMAT_UNKNOWN;
   }
 }
 
-static gboolean gst_set_rga_info(rga_info_t *info, RgaSURF_FORMAT format,
-                                 guint width, guint height, guint hstride,
-                                 guint vstride) {
+static rga_buffer_t gst_rga_buffer_from_video_frame(GstVideoFrame *frame,
+                                                     GstMapInfo *map_info,
+                                                     GstMapFlags map_flags) {
+  rga_buffer_t buf = {0};
+
+  RgaSURF_FORMAT format =
+      gst_gst_format_to_rga_format(GST_VIDEO_FRAME_FORMAT(frame));
+  guint width = GST_VIDEO_FRAME_WIDTH(frame);
+  guint height = GST_VIDEO_FRAME_HEIGHT(frame);
+  guint hstride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0);
+  guint vstride = GST_VIDEO_FRAME_N_PLANES(frame) == 1
+                      ? GST_VIDEO_INFO_HEIGHT(&frame->info)
+                      : GST_VIDEO_INFO_PLANE_OFFSET(&frame->info, 1) / hstride;
+
   gint pixel_stride;
 
   switch (format) {
@@ -220,67 +303,38 @@ static gboolean gst_set_rga_info(rga_info_t *info, RgaSURF_FORMAT format,
     case RK_FORMAT_RGB_565:
       pixel_stride = 2;
       break;
-    case RK_FORMAT_YCbCr_420_SP_10B:
-    case RK_FORMAT_YCbCr_422_SP:
-    case RK_FORMAT_YCrCb_422_SP:
-    case RK_FORMAT_YCbCr_422_P:
-    case RK_FORMAT_YCrCb_422_P:
-    case RK_FORMAT_YCbCr_420_SP:
-    case RK_FORMAT_YCrCb_420_SP:
-    case RK_FORMAT_YCbCr_420_P:
-    case RK_FORMAT_YCrCb_420_P:
+    default:
       pixel_stride = 1;
 
       /* RGA requires yuv image rect align to 2 */
       width &= ~1;
       height &= ~1;
       break;
-    default:
-      return FALSE;
   }
-
-  if (info->fd < 0 && !info->virAddr) return FALSE;
 
   if (hstride / pixel_stride >= width) hstride /= pixel_stride;
 
-  info->mmuFlag = 1;
-  rga_set_rect(&info->rect, 0, 0, width, height, hstride, vstride, format);
-  return TRUE;
-}
+  buf.width = width;
+  buf.height = height;
+  buf.wstride = hstride;
+  buf.hstride = vstride;
+  buf.format = format;
 
-static gboolean gst_rga_info_from_video_frame(rga_info_t *info,
-                                              GstVideoFrame *frame,
-                                              GstMapInfo *mapInfo,
-                                              GstMapFlags mapFlag) {
-  RgaSURF_FORMAT rga_format =
-      gst_gst_format_to_rga_format(GST_VIDEO_FRAME_FORMAT(frame));
-
-  guint width = GST_VIDEO_FRAME_WIDTH(frame);
-  guint height = GST_VIDEO_FRAME_HEIGHT(frame);
-  guint hstride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0);
-  guint vstride = GST_VIDEO_FRAME_N_PLANES(frame) == 1
-                      ? GST_VIDEO_INFO_HEIGHT(&frame->info)
-                      : GST_VIDEO_INFO_PLANE_OFFSET(&frame->info, 1) / hstride;
-
-  if (!gst_set_rga_info(info, rga_format, width, height, hstride, vstride)) {
-    return FALSE;
-  }
-  GstBuffer *inbuf = frame->buffer;
-  if (gst_buffer_n_memory(inbuf) == 1) {
-    GstMemory *mem = gst_buffer_peek_memory(inbuf, 0);
-    gsize offset;
-
+  GstBuffer *gbuf = frame->buffer;
+  if (gst_buffer_n_memory(gbuf) == 1) {
+    GstMemory *mem = gst_buffer_peek_memory(gbuf, 0);
     if (gst_is_dmabuf_memory(mem)) {
+      gsize offset;
       gst_memory_get_sizes(mem, &offset, NULL);
-      if (!offset) info->fd = gst_dmabuf_memory_get_fd(mem);
+      if (!offset) buf.fd = gst_dmabuf_memory_get_fd(mem);
     }
   }
 
-  if (info->fd <= 0) {
-    gst_buffer_map(inbuf, mapInfo, mapFlag);
-    info->virAddr = mapInfo->data;
+  if (buf.fd <= 0) {
+    gst_buffer_map(gbuf, map_info, map_flags);
+    buf.vir_addr = map_info->data;
   }
-  return TRUE;
+  return buf;
 }
 
 static GstCaps *gst_rga_video_convert_transform_caps(GstBaseTransform *trans,
@@ -313,12 +367,12 @@ static GstCaps *gst_rga_video_convert_transform_caps(GstBaseTransform *trans,
 
     if (direction == GST_PAD_SRC) {
       // rga 输出最大 4096
-      gst_structure_set(structure, "width", GST_TYPE_INT_RANGE, 1, 4096,
-                        "height", GST_TYPE_INT_RANGE, 1, 4096, NULL);
+      gst_structure_set(structure, "width", GST_TYPE_INT_RANGE, 2, 4096,
+                        "height", GST_TYPE_INT_RANGE, 2, 4096, NULL);
     } else {
       // 输入最大 8192
-      gst_structure_set(structure, "width", GST_TYPE_INT_RANGE, 1, 8192,
-                        "height", GST_TYPE_INT_RANGE, 1, 8192, NULL);
+      gst_structure_set(structure, "width", GST_TYPE_INT_RANGE, 2, 8192,
+                        "height", GST_TYPE_INT_RANGE, 2, 8192, NULL);
     }
     if (!gst_caps_features_is_any(features)) {
       gst_structure_remove_fields(structure, "format", "colorimetry",
@@ -351,6 +405,12 @@ static void gst_rga_video_convert_set_property(GObject *object, guint prop_id,
     case GST_RGA_PROP_CORE_MASK:
       rgavideoconvert->core_mask = g_value_get_flags(value);
       break;
+    case GST_RGA_PROP_FLIP:
+      rgavideoconvert->flip = g_value_get_enum(value);
+      break;
+    case GST_RGA_PROP_ROTATION:
+      rgavideoconvert->rotation = g_value_get_enum(value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
   }
@@ -363,6 +423,12 @@ static void gst_rga_video_convert_get_property(GObject *object, guint prop_id,
   switch (prop_id) {
     case GST_RGA_PROP_CORE_MASK:
       g_value_set_flags(value, rgavideoconvert->core_mask);
+      break;
+    case GST_RGA_PROP_FLIP:
+      g_value_set_enum(value, rgavideoconvert->flip);
+      break;
+    case GST_RGA_PROP_ROTATION:
+      g_value_set_enum(value, rgavideoconvert->rotation);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
@@ -384,7 +450,6 @@ static gboolean gst_rga_video_convert_start(GstBaseTransform *trans) {
 
 static gboolean gst_rga_video_convert_stop(GstBaseTransform *trans) {
   GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
-
   GST_DEBUG_OBJECT(rgavideoconvert, "stop");
   c_RkRgaDeInit();
   return TRUE;
@@ -417,39 +482,24 @@ static GstFlowReturn gst_rga_video_convert_transform_frame(
 
   GST_DEBUG_OBJECT(rgavideoconvert, "transform_frame");
 
-  GstMapInfo inMapinfo = {
-      0,
-  };
-  GstMapInfo outMapinfo = {
-      0,
-  };
+  GstMapInfo in_map = {0};
+  GstMapInfo out_map = {0};
 
-  rga_info_t src_info = {
-      0,
-  };
-  rga_info_t dst_info = {
-      0,
-  };
+  rga_buffer_t src = gst_rga_buffer_from_video_frame(inframe, &in_map, GST_MAP_READ);
+  rga_buffer_t dst = gst_rga_buffer_from_video_frame(outframe, &out_map, GST_MAP_WRITE);
 
-  if (!gst_rga_info_from_video_frame(&src_info, inframe, &inMapinfo,
-                                     GST_MAP_READ))
-    return GST_FLOW_ERROR;
+  if (rgavideoconvert->core_mask)
+    imconfig(IM_CONFIG_SCHEDULER_CORE, rgavideoconvert->core_mask);
 
-  if (!gst_rga_info_from_video_frame(&dst_info, outframe, &outMapinfo,
-                                     GST_MAP_WRITE))
-    return GST_FLOW_ERROR;
+  int usage = rgavideoconvert->flip | rgavideoconvert->rotation;
+  im_rect empty = {0};
+  IM_STATUS status = improcess(src, dst, (rga_buffer_t){0}, empty, empty, empty, usage);
 
-  gboolean ret = TRUE;
-  src_info.core = dst_info.core = rgavideoconvert->core_mask;
-  if (c_RkRgaBlit(&src_info, &dst_info, NULL) < 0) {
-    GST_WARNING_OBJECT(filter, "failed to blit");
-    ret = FALSE;
-  }
+  gst_buffer_unmap(inframe->buffer, &in_map);
+  gst_buffer_unmap(outframe->buffer, &out_map);
 
-  gst_buffer_unmap(inframe->buffer, &inMapinfo);
-  gst_buffer_unmap(outframe->buffer, &outMapinfo);
-
-  if (!ret) {
+  if (status != IM_STATUS_SUCCESS) {
+    GST_WARNING_OBJECT(filter, "improcess failed: %s", imStrError(status));
     return GST_FLOW_ERROR;
   }
 

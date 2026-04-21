@@ -43,6 +43,8 @@ typedef struct _GstRgaVideoConvertClass GstRgaVideoConvertClass;
 struct _GstRgaVideoConvert {
   GstVideoFilter base_rgavideoconvert;
   guint32 core_mask;
+  guint32 flip;
+  guint32 rotation;
 };
 
 struct _GstRgaVideoConvertClass {

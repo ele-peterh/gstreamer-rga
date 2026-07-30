@@ -42,9 +42,16 @@ typedef struct _GstRgaVideoConvertClass GstRgaVideoConvertClass;
 
 struct _GstRgaVideoConvert {
   GstVideoFilter base_rgavideoconvert;
+  /* All of these are guarded by the GstObject lock. */
   guint32 core_mask;
   guint32 flip;
+  /* What the property says. Used while negotiating, since a 90/270 rotation
+   * transposes the output caps. */
   guint32 rotation;
+  /* The rotation the currently negotiated caps were built for. This is the one
+   * handed to RGA, so that a property change mid-stream cannot rotate a frame
+   * into a buffer that was sized for the previous angle. */
+  guint32 active_rotation;
 };
 
 struct _GstRgaVideoConvertClass {

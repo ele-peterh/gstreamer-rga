@@ -142,7 +142,7 @@ Element Properties:
   core-mask           : Select which RGA core(s) to use (bit-mask)
                         flags: readable, writable
                         Flags "GstRgaCoreMask" Default: 0x00000000, "(none)"
-                           (0x00000001): auto             - auto
+                           (0x00000000): auto             - auto
                            (0x00000001): rga3_core0       - rga3_core0
                            (0x00000002): rga3_core1       - rga3_core1
                            (0x00000004): rga2_core0       - rga2_core0
@@ -240,6 +240,28 @@ The property is a **GEnum** value.
 | `270`           | 4   | `IM_HAL_TRANSFORM_ROT_270`   | rotate 270° CW |
 
 Set it per element: `… ! rgavideoconvert rotation=90 ! …`
+
+`90` and `270` transpose the image, so the **output caps swap width and height
+automatically** — no need to state the rotated size downstream:
+
+```bash
+# 1920x1080 in, 1080x1920 out
+gst-launch-1.0 videotestsrc ! video/x-raw,width=1920,height=1080,format=NV12 \
+  ! rgavideoconvert rotation=90 ! fakesink
+```
+
+You can still pin the output size explicitly, in which case RGA rotates *and*
+scales into it:
+
+```bash
+gst-launch-1.0 videotestsrc ! video/x-raw,width=1920,height=1080,format=NV12 \
+  ! rgavideoconvert rotation=90 ! video/x-raw,width=720,height=1280 ! fakesink
+```
+
+Changing `rotation` at runtime works too: switching between a transposing angle
+(90/270) and a non-transposing one (none/180) triggers renegotiation, and the
+new angle is applied to the frame after the caps have settled. Non-square pixel
+aspect ratios are inverted along with the swap.
 
 ### DMA‑BUF zero‑copy
 

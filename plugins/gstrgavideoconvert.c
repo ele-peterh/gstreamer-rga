@@ -193,8 +193,11 @@ static void gst_rga_video_convert_class_init(GstRgaVideoConvertClass *klass) {
       "http://github.com/corenel/gstreamer-rga");
 
   /* element properties */
+  /* "auto" is 0: no core is requested and imconfig() is not called at all, so
+   * librga's own scheduler decides. Note that IM_SCHEDULER_RGA3_DEFAULT is an
+   * alias for RGA3_CORE0, which is not the same thing. */
   static const GFlagsValue mask_values[] = {
-      {IM_SCHEDULER_RGA3_DEFAULT, "auto", "auto"},
+      {0, "auto", "auto"},
       {IM_SCHEDULER_RGA3_CORE0, "rga3_core0", "rga3_core0"},
       {IM_SCHEDULER_RGA3_CORE1, "rga3_core1", "rga3_core1"},
       {IM_SCHEDULER_RGA2_CORE0, "rga2_core0", "rga2_core0"},
@@ -203,10 +206,11 @@ static void gst_rga_video_convert_class_init(GstRgaVideoConvertClass *klass) {
       {0, NULL, NULL}};
   GType mask_type = g_flags_register_static("GstRgaCoreMask", mask_values);
 
+  /* Default to "auto" rather than pinning to RGA3: parts like the RK356x have
+   * no RGA3 core at all, and requesting one there would fail every job. */
   rga_props[GST_RGA_PROP_CORE_MASK] = g_param_spec_flags(
       "core-mask", "Core mask", "Select which RGA core(s) to use (bit-mask)",
-      mask_type, IM_SCHEDULER_RGA3_CORE0 | IM_SCHEDULER_RGA3_CORE1,
-      G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+      mask_type, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
 
   static const GEnumValue flip_values[] = {
       {0, "none", "none"},
@@ -260,22 +264,57 @@ static void gst_rga_video_convert_class_init(GstRgaVideoConvertClass *klass) {
       GST_DEBUG_FUNCPTR(gst_rga_video_convert_transform_frame);
 }
 
+/* 90 and 270 degree rotations transpose the image, so the two pads disagree
+ * about which dimension is the width. */
+static gboolean gst_rga_rotation_transposes(guint32 rotation) {
+  return rotation == IM_HAL_TRANSFORM_ROT_90 ||
+         rotation == IM_HAL_TRANSFORM_ROT_270;
+}
+
+static gboolean gst_rga_video_convert_transposes(
+    GstRgaVideoConvert *rgavideoconvert) {
+  gboolean transposes;
+
+  GST_OBJECT_LOCK(rgavideoconvert);
+  transposes = gst_rga_rotation_transposes(rgavideoconvert->rotation);
+  GST_OBJECT_UNLOCK(rgavideoconvert);
+
+  return transposes;
+}
+
 static GstCaps *gst_rga_video_convert_fixate_caps(GstBaseTransform *trans,
                                                    GstPadDirection direction,
                                                    GstCaps *caps,
                                                    GstCaps *othercaps) {
+  GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
   GstStructure *ins = gst_caps_get_structure(caps, 0);
   GstCaps *result = gst_caps_make_writable(othercaps);
   GstStructure *outs = gst_caps_get_structure(result, 0);
+  gboolean have_w, have_h;
   gint w, h;
   const gchar *fmt;
 
-  if (gst_structure_get_int(ins, "width", &w))
-    gst_structure_fixate_field_nearest_int(outs, "width", w);
-  if (gst_structure_get_int(ins, "height", &h))
-    gst_structure_fixate_field_nearest_int(outs, "height", h);
+  have_w = gst_structure_get_int(ins, "width", &w);
+  have_h = gst_structure_get_int(ins, "height", &h);
+
+  /* Default to keeping the size, transposed when we rotate by 90/270. Swapping
+   * is its own inverse, so the same swap is right in both directions. */
+  if (gst_rga_video_convert_transposes(rgavideoconvert)) {
+    gboolean had_w = have_w;
+    gint old_w = w;
+
+    have_w = have_h;
+    w = h;
+    have_h = had_w;
+    h = old_w;
+  }
+
+  if (have_w) gst_structure_fixate_field_nearest_int(outs, "width", w);
+  if (have_h) gst_structure_fixate_field_nearest_int(outs, "height", h);
   if ((fmt = gst_structure_get_string(ins, "format")))
     gst_structure_fixate_field_string(outs, "format", fmt);
+
+  GST_DEBUG_OBJECT(trans, "fixated to %" GST_PTR_FORMAT, result);
 
   return gst_caps_fixate(result);
 }
@@ -335,11 +374,19 @@ static void gst_rga_buffer_set_geometry(rga_buffer_t *buf,
 
   gint pixel_stride;
 
+  /* RGA counts wstride in pixels, GStreamer in bytes, so the byte stride has to
+   * be divided by the size of a pixel. Every format the pads advertise needs an
+   * entry here - a missing one lands in the default and describes the surface
+   * as pixel_stride times too wide, which the driver rejects. */
   switch (format) {
-    case RK_FORMAT_RGBX_8888:
-    case RK_FORMAT_BGRX_8888:
     case RK_FORMAT_RGBA_8888:
     case RK_FORMAT_BGRA_8888:
+    case RK_FORMAT_ARGB_8888:
+    case RK_FORMAT_ABGR_8888:
+    case RK_FORMAT_RGBX_8888:
+    case RK_FORMAT_BGRX_8888:
+    case RK_FORMAT_XRGB_8888:
+    case RK_FORMAT_XBGR_8888:
       pixel_stride = 4;
       break;
     case RK_FORMAT_RGB_888:
@@ -348,15 +395,22 @@ static void gst_rga_buffer_set_geometry(rga_buffer_t *buf,
       break;
     case RK_FORMAT_RGBA_5551:
     case RK_FORMAT_RGB_565:
+    /* Packed 4:2:2 is two bytes per pixel as well. */
+    case RK_FORMAT_YUYV_422:
+    case RK_FORMAT_YVYU_422:
+    case RK_FORMAT_UYVY_422:
       pixel_stride = 2;
       break;
     default:
+      /* planar and semi-planar YUV, and grayscale: one byte per sample */
       pixel_stride = 1;
-
-      /* RGA requires yuv image rect align to 2 */
-      width &= ~1;
-      height &= ~1;
       break;
+  }
+
+  /* RGA requires yuv image rect align to 2 */
+  if (GST_VIDEO_INFO_IS_YUV(info) || GST_VIDEO_INFO_IS_GRAY(info)) {
+    width &= ~1;
+    height &= ~1;
   }
 
   if (hstride / pixel_stride >= width) hstride /= pixel_stride;
@@ -366,6 +420,9 @@ static void gst_rga_buffer_set_geometry(rga_buffer_t *buf,
   buf->wstride = hstride;
   buf->hstride = vstride;
   buf->format = format;
+
+  GST_LOG("%s %ux%u, wstride %u px, hstride %u, rga format 0x%x",
+          GST_VIDEO_INFO_NAME(info), width, height, hstride, vstride, format);
 }
 
 /* Returns the DMABuf file descriptor backing @buffer, or -1 when @buffer cannot
@@ -467,10 +524,18 @@ static GstFlowReturn gst_rga_video_convert_run(
     GstRgaVideoConvert *rgavideoconvert, rga_buffer_t *src, rga_buffer_t *dst) {
   im_rect empty = {0};
   IM_STATUS status;
-  int usage = rgavideoconvert->flip | rgavideoconvert->rotation;
+  guint32 core_mask;
+  int usage;
 
-  if (rgavideoconvert->core_mask)
-    imconfig(IM_CONFIG_SCHEDULER_CORE, rgavideoconvert->core_mask);
+  /* Snapshot the properties, then let go of the lock before entering librga.
+   * active_rotation rather than rotation: the buffers were sized for the angle
+   * the caps were negotiated with. */
+  GST_OBJECT_LOCK(rgavideoconvert);
+  core_mask = rgavideoconvert->core_mask;
+  usage = rgavideoconvert->flip | rgavideoconvert->active_rotation;
+  GST_OBJECT_UNLOCK(rgavideoconvert);
+
+  if (core_mask) imconfig(IM_CONFIG_SCHEDULER_CORE, core_mask);
 
   status =
       improcess(*src, *dst, (rga_buffer_t){0}, empty, empty, empty, usage);
@@ -495,6 +560,8 @@ static GstCaps *gst_rga_video_convert_transform_caps(GstBaseTransform *trans,
   GstStructure *structure;
   GstCapsFeatures *features;
   gint i, n;
+  gboolean transposes =
+      gst_rga_video_convert_transposes(gst_rga_video_convert(trans));
 
   ret = gst_caps_new_empty();
   n = gst_caps_get_size(caps);
@@ -519,6 +586,21 @@ static GstCaps *gst_rga_video_convert_transform_caps(GstBaseTransform *trans,
       gst_structure_set(structure, "width", GST_TYPE_INT_RANGE, 2, 8192,
                         "height", GST_TYPE_INT_RANGE, 2, 8192, NULL);
     }
+
+    /* The ranges above are square, so transposing does not change them - we
+     * scale anyway, any size in range is on offer. Non-square pixels do become
+     * their own inverse though, and fixate_caps() swaps the dimensions once a
+     * concrete size is picked. */
+    if (transposes) {
+      gint par_n, par_d;
+
+      if (gst_structure_get_fraction(structure, "pixel-aspect-ratio", &par_n,
+                                     &par_d) &&
+          par_n > 0 && par_d > 0)
+        gst_structure_set(structure, "pixel-aspect-ratio", GST_TYPE_FRACTION,
+                          par_d, par_n, NULL);
+    }
+
     if (gst_caps_features_is_any(features)) {
       gst_caps_append_structure_full(ret, structure,
                                      gst_caps_features_copy(features));
@@ -579,14 +661,36 @@ static void gst_rga_video_convert_set_property(GObject *object, guint prop_id,
   GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(object);
   switch (prop_id) {
     case GST_RGA_PROP_CORE_MASK:
+      GST_OBJECT_LOCK(rgavideoconvert);
       rgavideoconvert->core_mask = g_value_get_flags(value);
+      GST_OBJECT_UNLOCK(rgavideoconvert);
       break;
     case GST_RGA_PROP_FLIP:
+      GST_OBJECT_LOCK(rgavideoconvert);
       rgavideoconvert->flip = g_value_get_enum(value);
+      GST_OBJECT_UNLOCK(rgavideoconvert);
       break;
-    case GST_RGA_PROP_ROTATION:
-      rgavideoconvert->rotation = g_value_get_enum(value);
+    case GST_RGA_PROP_ROTATION: {
+      guint32 rotation = g_value_get_enum(value);
+      gboolean renegotiate;
+
+      GST_OBJECT_LOCK(rgavideoconvert);
+      renegotiate = gst_rga_rotation_transposes(rotation) !=
+                    gst_rga_rotation_transposes(rgavideoconvert->rotation);
+      rgavideoconvert->rotation = rotation;
+      /* When the transposition is unchanged the negotiated caps stay valid, so
+       * the new angle can be used from the next frame on. Otherwise set_info()
+       * latches it once the renegotiated caps are in place. */
+      if (!renegotiate) rgavideoconvert->active_rotation = rotation;
+      GST_OBJECT_UNLOCK(rgavideoconvert);
+
+      if (renegotiate) {
+        GST_DEBUG_OBJECT(rgavideoconvert,
+                         "rotation changed to %u, renegotiating caps", rotation);
+        gst_base_transform_reconfigure_src(GST_BASE_TRANSFORM(rgavideoconvert));
+      }
       break;
+    }
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
   }
@@ -596,6 +700,8 @@ static void gst_rga_video_convert_get_property(GObject *object, guint prop_id,
                                                GValue *value,
                                                GParamSpec *pspec) {
   GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(object);
+
+  GST_OBJECT_LOCK(rgavideoconvert);
   switch (prop_id) {
     case GST_RGA_PROP_CORE_MASK:
       g_value_set_flags(value, rgavideoconvert->core_mask);
@@ -609,18 +715,23 @@ static void gst_rga_video_convert_get_property(GObject *object, guint prop_id,
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
   }
+  GST_OBJECT_UNLOCK(rgavideoconvert);
 }
 
 static void gst_rga_video_convert_init(GstRgaVideoConvert *rgavideoconvert) {}
 
 static gboolean gst_rga_video_convert_start(GstBaseTransform *trans) {
   GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
+  guint32 core_mask;
 
   GST_DEBUG_OBJECT(rgavideoconvert, "start");
   c_RkRgaInit();
-  if (rgavideoconvert->core_mask) {
-    imconfig(IM_CONFIG_SCHEDULER_CORE, rgavideoconvert->core_mask);
-  }
+
+  GST_OBJECT_LOCK(rgavideoconvert);
+  core_mask = rgavideoconvert->core_mask;
+  GST_OBJECT_UNLOCK(rgavideoconvert);
+
+  if (core_mask) imconfig(IM_CONFIG_SCHEDULER_CORE, core_mask);
   return TRUE;
 }
 
@@ -740,7 +851,19 @@ static gboolean gst_rga_video_convert_set_info(GstVideoFilter *filter,
     return FALSE;
   }
 
-  GST_DEBUG_OBJECT(rgavideoconvert, "dmabuf in: %d, dmabuf out: %d",
+  /* These caps were negotiated for the rotation the property held while
+   * transform_caps()/fixate_caps() ran. Latch it, so the frames RGA writes
+   * always match the size of the buffers they go into. */
+  GST_OBJECT_LOCK(rgavideoconvert);
+  rgavideoconvert->active_rotation = rgavideoconvert->rotation;
+  GST_OBJECT_UNLOCK(rgavideoconvert);
+
+  GST_DEBUG_OBJECT(rgavideoconvert,
+                   "%dx%d -> %dx%d, dmabuf in: %d, dmabuf out: %d",
+                   GST_VIDEO_INFO_WIDTH(in_info),
+                   GST_VIDEO_INFO_HEIGHT(in_info),
+                   GST_VIDEO_INFO_WIDTH(out_info),
+                   GST_VIDEO_INFO_HEIGHT(out_info),
                    gst_rga_caps_have_dmabuf(incaps),
                    gst_rga_caps_have_dmabuf(outcaps));
   return TRUE;

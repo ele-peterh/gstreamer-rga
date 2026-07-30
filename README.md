@@ -18,6 +18,7 @@ RGA is Rockchip’s on‑chip 2D engine that performs BLIT, resize, rotation and
     - [`core-mask` Property](#core-mask-property)
     - [`flip` Property](#flip-property)
     - [`rotation` Property](#rotation-property)
+    - [DMA‑BUF zero‑copy](#dmabuf-zerocopy)
     - [Multiple streams (stress test)](#multiple-streams-stress-test)
   - [Best Practice](#best-practice)
   - [Troubleshooting](#troubleshooting)
@@ -99,6 +100,11 @@ Pad Templates:
   SINK template: 'sink'
     Availability: Always
     Capabilities:
+      video/x-raw(memory:DMABuf)
+                 format: { (string)RGBA, (string)BGRA, (string)ARGB, (string)ABGR, (string)RGBx, (string)BGRx, (string)xRGB, (string)xBGR, (string)RGB, (string)BGR, (string)RGB16, (string)NV12, (string)NV21, (string)NV16, (string)NV61, (string)I420, (string)YV12, (string)Y42B, (string)YUY2, (string)YVYU, (string)UYVY, (string)GRAY8 }
+                  width: [ 2, 8192 ]
+                 height: [ 2, 8192 ]
+              framerate: [ 0/1, 2147483647/1 ]
       video/x-raw
                  format: { (string)RGBA, (string)BGRA, (string)ARGB, (string)ABGR, (string)RGBx, (string)BGRx, (string)xRGB, (string)xBGR, (string)RGB, (string)BGR, (string)RGB16, (string)NV12, (string)NV21, (string)NV16, (string)NV61, (string)I420, (string)YV12, (string)Y42B, (string)YUY2, (string)YVYU, (string)UYVY, (string)GRAY8 }
                   width: [ 2, 8192 ]
@@ -109,6 +115,11 @@ Pad Templates:
     Availability: Always
     Capabilities:
       video/x-raw
+                 format: { (string)RGBA, (string)BGRA, (string)ARGB, (string)ABGR, (string)RGBx, (string)BGRx, (string)xRGB, (string)xBGR, (string)RGB, (string)BGR, (string)RGB16, (string)NV12, (string)NV21, (string)NV16, (string)NV61, (string)I420, (string)YV12, (string)Y42B, (string)YUY2, (string)YVYU, (string)UYVY, (string)GRAY8 }
+                  width: [ 2, 4096 ]
+                 height: [ 2, 4096 ]
+              framerate: [ 0/1, 2147483647/1 ]
+      video/x-raw(memory:DMABuf)
                  format: { (string)RGBA, (string)BGRA, (string)ARGB, (string)ABGR, (string)RGBx, (string)BGRx, (string)xRGB, (string)xBGR, (string)RGB, (string)BGR, (string)RGB16, (string)NV12, (string)NV21, (string)NV16, (string)NV61, (string)I420, (string)YV12, (string)Y42B, (string)YUY2, (string)YVYU, (string)UYVY, (string)GRAY8 }
                   width: [ 2, 4096 ]
                  height: [ 2, 4096 ]
@@ -226,6 +237,30 @@ The property is a **GEnum** value.
 | `270`           | 4   | `IM_HAL_TRANSFORM_ROT_270`   | rotate 270° CW |
 
 Set it per element: `… ! rgavideoconvert rotation=90 ! …`
+
+### DMA‑BUF zero‑copy
+
+Both pads carry the `memory:DMABuf` caps feature. When a buffer is backed by a
+single dmabuf memory the file descriptor is imported into RGA
+(`wrapbuffer_fd()`) and the frame is never mapped for the CPU; anything else
+falls back to virtual‑address wrapping (`wrapbuffer_virtualaddr()`), so mixed
+pipelines keep working.
+
+```bash
+# Force the decoder to hand over dmabuf FDs (no CPU mapping on the sink pad)
+gst-launch-1.0 filesrc location=test.h264 ! h264parse ! mppvideodec \
+  ! video/x-raw\(memory:DMABuf\) ! rgavideoconvert core-mask=rga3 \
+  ! video/x-raw,width=1280,height=720,format=BGRx ! fakesink
+
+# Verify which path is taken
+GST_DEBUG=rgavideoconvert:6 gst-launch-1.0 … 2>&1 | grep -m1 "dmabuf\|virtual"
+```
+
+The element imports DMABufs but cannot export one: RGA writes into memory that
+somebody else allocated. `memory:DMABuf` on the **src** pad therefore requires a
+downstream element that offers a dmabuf buffer pool — if it offers no pool at
+all, negotiation fails with an explicit error. System memory is listed first on
+the src pad so that plain consumers are unaffected.
 
 ### Multiple streams (stress test)
 

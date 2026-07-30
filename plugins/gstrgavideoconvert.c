@@ -28,6 +28,15 @@
  * rgavideoconvert ! video/x-raw,format=RGBA,width=640,height=480 ! fakesink
  * ]|
  * convert 1920x1080 ---> 640x480 and NV12 ---> RGBA .
+ *
+ * Both pads also accept the "memory:DMABuf" caps feature. When upstream hands
+ * us DMABuf backed buffers the file descriptor is imported into RGA directly,
+ * so no CPU mapping of the frame takes place:
+ * |[
+ * gst-launch-1.0 -v filesrc location=in.mp4 ! parsebin ! mppvideodec !
+ * video/x-raw\(memory:DMABuf\) ! rgavideoconvert !
+ * video/x-raw,format=RGBA,width=640,height=480 ! fakesink
+ * ]|
  * </refsect2>
  */
 
@@ -39,11 +48,16 @@
 #include <gst/allocators/gstdmabuf.h>
 #include <gst/gst.h>
 #include <gst/video/gstvideofilter.h>
+#include <gst/video/gstvideopool.h>
 #include <gst/video/video.h>
 
 #include "gstrgavideoconvert.h"  // NOLINT
 #include "rga/RgaApi.h"
 #include "rga/im2d.h"
+
+#ifndef GST_CAPS_FEATURE_MEMORY_DMABUF
+#define GST_CAPS_FEATURE_MEMORY_DMABUF "memory:DMABuf"
+#endif
 
 GST_DEBUG_CATEGORY_STATIC(gst_rga_video_convert_debug_category);
 #define GST_CAT_DEFAULT gst_rga_video_convert_debug_category
@@ -67,11 +81,21 @@ static GstCaps *gst_rga_video_convert_fixate_caps(GstBaseTransform *trans,
                                                    GstCaps *caps,
                                                    GstCaps *othercaps);
 
+static gboolean gst_rga_video_convert_propose_allocation(
+    GstBaseTransform *trans, GstQuery *decide_query, GstQuery *query);
+
+static gboolean gst_rga_video_convert_decide_allocation(GstBaseTransform *trans,
+                                                        GstQuery *query);
+
 static gboolean gst_rga_video_convert_set_info(GstVideoFilter *filter,
                                                GstCaps *incaps,
                                                GstVideoInfo *in_info,
                                                GstCaps *outcaps,
                                                GstVideoInfo *out_info);
+
+static GstFlowReturn gst_rga_video_convert_transform(GstBaseTransform *trans,
+                                                     GstBuffer *inbuf,
+                                                     GstBuffer *outbuf);
 
 static GstFlowReturn gst_rga_video_convert_transform_frame(
     GstVideoFilter *filter, GstVideoFrame *inframe, GstVideoFrame *outframe);
@@ -89,19 +113,34 @@ static GstFlowReturn gst_rga_video_convert_transform_frame(
   "YUY2, YVYU, UYVY, " \
   "GRAY8 }"
 
-#define VIDEO_SRC_CAPS \
-  "video/x-raw, " \
+#define RGA_CAPS_FIELDS(max_width, max_height) \
   "format = (string) " RGA_FORMATS ", " \
-  "width = (int) [ 2, 4096 ], " \
-  "height = (int) [ 2, 4096 ], " \
+  "width = (int) [ 2, " max_width " ], " \
+  "height = (int) [ 2, " max_height " ], " \
   "framerate = (fraction) [ 0, max ]"
 
+#define RGA_DMABUF_CAPS(max_width, max_height) \
+  "video/x-raw(" GST_CAPS_FEATURE_MEMORY_DMABUF "), " \
+  RGA_CAPS_FIELDS(max_width, max_height)
+
+#define RGA_SYSMEM_CAPS(max_width, max_height) \
+  "video/x-raw, " RGA_CAPS_FIELDS(max_width, max_height)
+
+/* System memory comes first on the src pad: RGA renders into memory that
+ * somebody else allocated and we cannot export a DMABuf ourselves, so DMABuf
+ * output only works when downstream provides a DMABuf pool. Downstream that
+ * wants DMABufs still gets them, its own caps order wins during negotiation. 
+ * On output prefer system memory since if a downstream element has ANY memory requirement
+ * it does not care what input it gets and will not allocate no buffer for us.
+ * So the only memory we can allocate is system memory. */
+#define VIDEO_SRC_CAPS \
+  RGA_SYSMEM_CAPS("4096", "4096") "; " RGA_DMABUF_CAPS("4096", "4096")
+
+/* DMABuf comes first on the sink pad: importing an fd is always cheaper than
+ * mapping the frame for the CPU. Prefer dma on input and negotiate for 
+ * it if the upstream element provides it. */
 #define VIDEO_SINK_CAPS \
-  "video/x-raw, " \
-  "format = (string) " RGA_FORMATS ", " \
-  "width = (int) [ 2, 8192 ], " \
-  "height = (int) [ 2, 8192 ], " \
-  "framerate = (fraction) [ 0, max ]"
+  RGA_DMABUF_CAPS("8192", "8192") "; " RGA_SYSMEM_CAPS("8192", "8192")
 
 /* element properties */
 
@@ -205,8 +244,16 @@ static void gst_rga_video_convert_class_init(GstRgaVideoConvertClass *klass) {
 
   base_transform_class->fixate_caps =
       GST_DEBUG_FUNCPTR(gst_rga_video_convert_fixate_caps);
+  base_transform_class->propose_allocation =
+      GST_DEBUG_FUNCPTR(gst_rga_video_convert_propose_allocation);
+  base_transform_class->decide_allocation =
+      GST_DEBUG_FUNCPTR(gst_rga_video_convert_decide_allocation);
   base_transform_class->start = GST_DEBUG_FUNCPTR(gst_rga_video_convert_start);
   base_transform_class->stop = GST_DEBUG_FUNCPTR(gst_rga_video_convert_stop);
+  /* transform() takes the zero-copy path when a DMABuf is involved and falls
+   * back to GstVideoFilter's mapped transform_frame() otherwise. */
+  base_transform_class->transform =
+      GST_DEBUG_FUNCPTR(gst_rga_video_convert_transform);
   video_filter_class->set_info =
       GST_DEBUG_FUNCPTR(gst_rga_video_convert_set_info);
   video_filter_class->transform_frame =
@@ -272,19 +319,19 @@ static RgaSURF_FORMAT gst_gst_format_to_rga_format(GstVideoFormat format) {
   }
 }
 
-static rga_buffer_t gst_rga_buffer_from_video_frame(GstVideoFrame *frame,
-                                                     GstMapInfo *map_info,
-                                                     GstMapFlags map_flags) {
-  rga_buffer_t buf = {0};
-
+/* Fills in the geometry of @buf from @info. wrapbuffer_fd() and
+ * wrapbuffer_virtualaddr() assume unpadded buffers, so the strides always have
+ * to be corrected afterwards. */
+static void gst_rga_buffer_set_geometry(rga_buffer_t *buf,
+                                        const GstVideoInfo *info) {
   RgaSURF_FORMAT format =
-      gst_gst_format_to_rga_format(GST_VIDEO_FRAME_FORMAT(frame));
-  guint width = GST_VIDEO_FRAME_WIDTH(frame);
-  guint height = GST_VIDEO_FRAME_HEIGHT(frame);
-  guint hstride = GST_VIDEO_FRAME_PLANE_STRIDE(frame, 0);
-  guint vstride = GST_VIDEO_FRAME_N_PLANES(frame) == 1
-                      ? GST_VIDEO_INFO_HEIGHT(&frame->info)
-                      : GST_VIDEO_INFO_PLANE_OFFSET(&frame->info, 1) / hstride;
+      gst_gst_format_to_rga_format(GST_VIDEO_INFO_FORMAT(info));
+  guint width = GST_VIDEO_INFO_WIDTH(info);
+  guint height = GST_VIDEO_INFO_HEIGHT(info);
+  guint hstride = GST_VIDEO_INFO_PLANE_STRIDE(info, 0);
+  guint vstride = GST_VIDEO_INFO_N_PLANES(info) == 1
+                      ? GST_VIDEO_INFO_HEIGHT(info)
+                      : GST_VIDEO_INFO_PLANE_OFFSET(info, 1) / hstride;
 
   gint pixel_stride;
 
@@ -314,27 +361,125 @@ static rga_buffer_t gst_rga_buffer_from_video_frame(GstVideoFrame *frame,
 
   if (hstride / pixel_stride >= width) hstride /= pixel_stride;
 
-  buf.width = width;
-  buf.height = height;
-  buf.wstride = hstride;
-  buf.hstride = vstride;
-  buf.format = format;
+  buf->width = width;
+  buf->height = height;
+  buf->wstride = hstride;
+  buf->hstride = vstride;
+  buf->format = format;
+}
 
-  GstBuffer *gbuf = frame->buffer;
-  if (gst_buffer_n_memory(gbuf) == 1) {
-    GstMemory *mem = gst_buffer_peek_memory(gbuf, 0);
-    if (gst_is_dmabuf_memory(mem)) {
-      gsize offset;
-      gst_memory_get_sizes(mem, &offset, NULL);
-      if (!offset) buf.fd = gst_dmabuf_memory_get_fd(mem);
-    }
-  }
+/* Returns the DMABuf file descriptor backing @buffer, or -1 when @buffer cannot
+ * be handed to RGA as a DMABuf. RGA imports a whole fd, so the buffer has to be
+ * backed by a single dmabuf memory starting at offset 0. */
+static gint gst_rga_buffer_get_dmabuf_fd(GstBuffer *buffer) {
+  GstMemory *mem;
+  gsize offset;
 
-  if (buf.fd <= 0) {
-    gst_buffer_map(gbuf, map_info, map_flags);
-    buf.vir_addr = map_info->data;
+  if (gst_buffer_n_memory(buffer) != 1) return -1;
+
+  mem = gst_buffer_peek_memory(buffer, 0);
+  if (!gst_is_dmabuf_memory(mem)) return -1;
+
+  gst_memory_get_sizes(mem, &offset, NULL);
+  if (offset != 0) return -1;
+
+  return gst_dmabuf_memory_get_fd(mem);
+}
+
+/* gst_video_frame_map() applies the GstVideoMeta for us; DMABufs are never
+ * mapped, so their layout has to be picked up by hand. */
+static void gst_rga_video_info_from_buffer(const GstVideoInfo *ref,
+                                           GstBuffer *buffer,
+                                           GstVideoInfo *info) {
+  GstVideoMeta *meta = gst_buffer_get_video_meta(buffer);
+  guint i;
+
+  *info = *ref;
+  if (meta == NULL) return;
+
+  GST_VIDEO_INFO_WIDTH(info) = meta->width;
+  GST_VIDEO_INFO_HEIGHT(info) = meta->height;
+  for (i = 0; i < meta->n_planes && i < GST_VIDEO_MAX_PLANES; i++) {
+    GST_VIDEO_INFO_PLANE_OFFSET(info, i) = meta->offset[i];
+    GST_VIDEO_INFO_PLANE_STRIDE(info, i) = meta->stride[i];
   }
+}
+
+static rga_buffer_t gst_rga_buffer_from_video_frame(GstVideoFrame *frame) {
+  rga_buffer_t buf = wrapbuffer_virtualaddr(
+      GST_VIDEO_FRAME_PLANE_DATA(frame, 0), GST_VIDEO_FRAME_WIDTH(frame),
+      GST_VIDEO_FRAME_HEIGHT(frame),
+      gst_gst_format_to_rga_format(GST_VIDEO_FRAME_FORMAT(frame)));
+
+  gst_rga_buffer_set_geometry(&buf, &frame->info);
   return buf;
+}
+
+/* One side of the conversion as librga sees it, plus the CPU mapping that had
+ * to be taken when the buffer could not be imported as a DMABuf. */
+typedef struct {
+  rga_buffer_t buf;
+  GstVideoFrame frame;
+  gboolean mapped;
+} GstRgaSurface;
+
+static gboolean gst_rga_surface_open(GstRgaVideoConvert *rgavideoconvert,
+                                     GstBuffer *buffer,
+                                     const GstVideoInfo *info,
+                                     GstMapFlags map_flags,
+                                     GstRgaSurface *surface) {
+  gint fd;
+
+  *surface = (GstRgaSurface){0};
+
+  fd = gst_rga_buffer_get_dmabuf_fd(buffer);
+  if (fd >= 0) {
+    GstVideoInfo dmabuf_info;
+
+    gst_rga_video_info_from_buffer(info, buffer, &dmabuf_info);
+    surface->buf = wrapbuffer_fd(
+        fd, GST_VIDEO_INFO_WIDTH(&dmabuf_info),
+        GST_VIDEO_INFO_HEIGHT(&dmabuf_info),
+        gst_gst_format_to_rga_format(GST_VIDEO_INFO_FORMAT(&dmabuf_info)));
+    gst_rga_buffer_set_geometry(&surface->buf, &dmabuf_info);
+
+    GST_LOG_OBJECT(rgavideoconvert, "imported dmabuf fd %d", fd);
+    return TRUE;
+  }
+
+  if (!gst_video_frame_map(&surface->frame, (GstVideoInfo *)info, buffer,
+                           map_flags)) {
+    GST_ERROR_OBJECT(rgavideoconvert, "failed to map buffer %" GST_PTR_FORMAT,
+                     buffer);
+    return FALSE;
+  }
+  surface->mapped = TRUE;
+  surface->buf = gst_rga_buffer_from_video_frame(&surface->frame);
+  return TRUE;
+}
+
+static void gst_rga_surface_close(GstRgaSurface *surface) {
+  if (surface->mapped) gst_video_frame_unmap(&surface->frame);
+  surface->mapped = FALSE;
+}
+
+static GstFlowReturn gst_rga_video_convert_run(
+    GstRgaVideoConvert *rgavideoconvert, rga_buffer_t *src, rga_buffer_t *dst) {
+  im_rect empty = {0};
+  IM_STATUS status;
+  int usage = rgavideoconvert->flip | rgavideoconvert->rotation;
+
+  if (rgavideoconvert->core_mask)
+    imconfig(IM_CONFIG_SCHEDULER_CORE, rgavideoconvert->core_mask);
+
+  status =
+      improcess(*src, *dst, (rga_buffer_t){0}, empty, empty, empty, usage);
+  if (status != IM_STATUS_SUCCESS) {
+    GST_WARNING_OBJECT(rgavideoconvert, "improcess failed: %s",
+                       imStrError(status));
+    return GST_FLOW_ERROR;
+  }
+  return GST_FLOW_OK;
 }
 
 static GstCaps *gst_rga_video_convert_transform_caps(GstBaseTransform *trans,
@@ -374,11 +519,42 @@ static GstCaps *gst_rga_video_convert_transform_caps(GstBaseTransform *trans,
       gst_structure_set(structure, "width", GST_TYPE_INT_RANGE, 2, 8192,
                         "height", GST_TYPE_INT_RANGE, 2, 8192, NULL);
     }
-    if (!gst_caps_features_is_any(features)) {
-      gst_structure_remove_fields(structure, "format", "colorimetry",
-                                  "chroma-site", NULL);
+    if (gst_caps_features_is_any(features)) {
+      gst_caps_append_structure_full(ret, structure,
+                                     gst_caps_features_copy(features));
+      continue;
     }
 
+    gst_structure_remove_fields(structure, "format", "colorimetry",
+                                "chroma-site", NULL);
+
+    /* The memory type of the two pads is independent: RGA can read from a
+     * DMABuf and write into system memory and the other way round. Offer both
+     * for every structure, most preferred first. */
+    if (gst_caps_features_contains(features, GST_CAPS_FEATURE_MEMORY_DMABUF) ||
+        gst_caps_features_is_equal(features,
+                                   GST_CAPS_FEATURES_MEMORY_SYSTEM_MEMORY)) {
+      GstStructure *alternate = gst_structure_copy(structure);
+
+      if (direction == GST_PAD_SRC) {
+        /* transforming to the sink pad: importing a DMABuf beats mapping */
+        gst_caps_append_structure_full(
+            ret, structure,
+            gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
+        gst_caps_append_structure_full(ret, alternate,
+                                       gst_caps_features_new_empty());
+      } else {
+        /* transforming to the src pad: we cannot allocate DMABufs ourselves */
+        gst_caps_append_structure_full(ret, structure,
+                                       gst_caps_features_new_empty());
+        gst_caps_append_structure_full(
+            ret, alternate,
+            gst_caps_features_new(GST_CAPS_FEATURE_MEMORY_DMABUF, NULL));
+      }
+      continue;
+    }
+
+    /* some other memory type, leave it to the caps intersection below */
     gst_caps_append_structure_full(ret, structure,
                                    gst_caps_features_copy(features));
   }
@@ -455,6 +631,97 @@ static gboolean gst_rga_video_convert_stop(GstBaseTransform *trans) {
   return TRUE;
 }
 
+static gboolean gst_rga_caps_have_dmabuf(GstCaps *caps) {
+  guint i, n = gst_caps_get_size(caps);
+
+  for (i = 0; i < n; i++) {
+    GstCapsFeatures *features = gst_caps_get_features(caps, i);
+
+    if (features != NULL &&
+        gst_caps_features_contains(features, GST_CAPS_FEATURE_MEMORY_DMABUF))
+      return TRUE;
+  }
+  return FALSE;
+}
+
+static gboolean gst_rga_video_convert_propose_allocation(
+    GstBaseTransform *trans, GstQuery *decide_query, GstQuery *query) {
+  GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
+  GstCaps *caps = NULL;
+
+  if (!GST_BASE_TRANSFORM_CLASS(gst_rga_video_convert_parent_class)
+           ->propose_allocation(trans, decide_query, query))
+    return FALSE;
+
+  /* in passthrough the query was simply forwarded downstream */
+  if (decide_query == NULL) return TRUE;
+
+  /* We take the strides and plane offsets from the video meta, so upstream is
+   * free to hand us padded buffers. */
+  if (!gst_query_find_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL))
+    gst_query_add_allocation_meta(query, GST_VIDEO_META_API_TYPE, NULL);
+
+  gst_query_parse_allocation(query, &caps, NULL);
+  if (caps != NULL && gst_rga_caps_have_dmabuf(caps)) {
+    /* The fds have to come from upstream, we have no way of exporting one.
+     * Drop the system memory pool the parent class offers so that upstream
+     * keeps allocating from its own DMABuf pool. */
+#if GST_CHECK_VERSION(1, 16, 0)
+    while (gst_query_get_n_allocation_pools(query) > 0)
+      gst_query_remove_nth_allocation_pool(query, 0);
+#endif
+    GST_DEBUG_OBJECT(rgavideoconvert,
+                     "sink caps carry " GST_CAPS_FEATURE_MEMORY_DMABUF
+                     ", letting upstream allocate");
+  }
+
+  return TRUE;
+}
+
+static gboolean gst_rga_video_convert_decide_allocation(GstBaseTransform *trans,
+                                                        GstQuery *query) {
+  GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
+  GstCaps *caps = NULL;
+  GstBufferPool *pool = NULL;
+  guint size = 0, min = 0, max = 0;
+  gboolean want_dmabuf;
+
+  gst_query_parse_allocation(query, &caps, NULL);
+  want_dmabuf = caps != NULL && gst_rga_caps_have_dmabuf(caps);
+
+  if (gst_query_get_n_allocation_pools(query) > 0)
+    gst_query_parse_nth_allocation_pool(query, 0, &pool, &size, &min, &max);
+
+  if (want_dmabuf && pool == NULL) {
+    /* RGA renders into memory somebody else owns: we can import a DMABuf but
+     * not export one, so without a downstream pool the negotiated caps cannot
+     * be honoured. */
+    GST_ELEMENT_ERROR(rgavideoconvert, CORE, NEGOTIATION, (NULL),
+                      ("downstream negotiated " GST_CAPS_FEATURE_MEMORY_DMABUF
+                       " but does not offer a buffer pool"));
+    return FALSE;
+  }
+
+  if (pool != NULL) {
+    /* Ask for the video meta so the real strides of the pool buffers are
+     * known, they are what gets handed to RGA. */
+    if (gst_buffer_pool_has_option(pool, GST_BUFFER_POOL_OPTION_VIDEO_META)) {
+      GstStructure *config = gst_buffer_pool_get_config(pool);
+
+      gst_buffer_pool_config_add_option(config,
+                                        GST_BUFFER_POOL_OPTION_VIDEO_META);
+      if (!gst_buffer_pool_set_config(pool, config))
+        GST_WARNING_OBJECT(rgavideoconvert,
+                           "could not enable the video meta on the downstream "
+                           "pool");
+    }
+    gst_object_unref(pool);
+  }
+
+  return GST_BASE_TRANSFORM_CLASS(gst_rga_video_convert_parent_class)
+      ->decide_allocation(trans, query);
+}
+
 static gboolean gst_rga_video_convert_set_info(GstVideoFilter *filter,
                                                GstCaps *incaps,
                                                GstVideoInfo *in_info,
@@ -472,38 +739,67 @@ static gboolean gst_rga_video_convert_set_info(GstVideoFilter *filter,
                     in_format, out_format);
     return FALSE;
   }
+
+  GST_DEBUG_OBJECT(rgavideoconvert, "dmabuf in: %d, dmabuf out: %d",
+                   gst_rga_caps_have_dmabuf(incaps),
+                   gst_rga_caps_have_dmabuf(outcaps));
   return TRUE;
 }
 
 /* transform */
+
+/* Zero-copy path: whenever one of the buffers is backed by a DMABuf its fd goes
+ * straight to librga, so that buffer is never mapped for the CPU. When neither
+ * side is a DMABuf, GstVideoFilter maps both frames and calls
+ * transform_frame() below. */
+static GstFlowReturn gst_rga_video_convert_transform(GstBaseTransform *trans,
+                                                     GstBuffer *inbuf,
+                                                     GstBuffer *outbuf) {
+  GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
+  GstVideoFilter *filter = GST_VIDEO_FILTER(trans);
+  GstRgaSurface src, dst;
+  GstFlowReturn ret;
+
+  if (G_UNLIKELY(!filter->negotiated)) {
+    GST_ERROR_OBJECT(rgavideoconvert, "not negotiated");
+    return GST_FLOW_NOT_NEGOTIATED;
+  }
+
+  if (gst_rga_buffer_get_dmabuf_fd(inbuf) < 0 &&
+      gst_rga_buffer_get_dmabuf_fd(outbuf) < 0)
+    return GST_BASE_TRANSFORM_CLASS(gst_rga_video_convert_parent_class)
+        ->transform(trans, inbuf, outbuf);
+
+  GST_LOG_OBJECT(rgavideoconvert, "transform (dmabuf)");
+
+  if (!gst_rga_surface_open(rgavideoconvert, inbuf, &filter->in_info,
+                            GST_MAP_READ, &src))
+    return GST_FLOW_ERROR;
+
+  if (!gst_rga_surface_open(rgavideoconvert, outbuf, &filter->out_info,
+                            GST_MAP_WRITE, &dst)) {
+    gst_rga_surface_close(&src);
+    return GST_FLOW_ERROR;
+  }
+
+  ret = gst_rga_video_convert_run(rgavideoconvert, &src.buf, &dst.buf);
+
+  gst_rga_surface_close(&dst);
+  gst_rga_surface_close(&src);
+
+  return ret;
+}
+
 static GstFlowReturn gst_rga_video_convert_transform_frame(
     GstVideoFilter *filter, GstVideoFrame *inframe, GstVideoFrame *outframe) {
   GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(filter);
 
-  GST_DEBUG_OBJECT(rgavideoconvert, "transform_frame");
+  GST_LOG_OBJECT(rgavideoconvert, "transform_frame (virtual address)");
 
-  GstMapInfo in_map = {0};
-  GstMapInfo out_map = {0};
+  rga_buffer_t src = gst_rga_buffer_from_video_frame(inframe);
+  rga_buffer_t dst = gst_rga_buffer_from_video_frame(outframe);
 
-  rga_buffer_t src = gst_rga_buffer_from_video_frame(inframe, &in_map, GST_MAP_READ);
-  rga_buffer_t dst = gst_rga_buffer_from_video_frame(outframe, &out_map, GST_MAP_WRITE);
-
-  if (rgavideoconvert->core_mask)
-    imconfig(IM_CONFIG_SCHEDULER_CORE, rgavideoconvert->core_mask);
-
-  int usage = rgavideoconvert->flip | rgavideoconvert->rotation;
-  im_rect empty = {0};
-  IM_STATUS status = improcess(src, dst, (rga_buffer_t){0}, empty, empty, empty, usage);
-
-  gst_buffer_unmap(inframe->buffer, &in_map);
-  gst_buffer_unmap(outframe->buffer, &out_map);
-
-  if (status != IM_STATUS_SUCCESS) {
-    GST_WARNING_OBJECT(filter, "improcess failed: %s", imStrError(status));
-    return GST_FLOW_ERROR;
-  }
-
-  return GST_FLOW_OK;
+  return gst_rga_video_convert_run(rgavideoconvert, &src, &dst);
 }
 
 static gboolean plugin_init(GstPlugin *plugin) {

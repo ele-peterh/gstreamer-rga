@@ -62,8 +62,11 @@ $ ninja -C build
 # 4. Install (drop sudo if installing to HOME)
 $ sudo ninja -C build install
 
-# 5. Tell GStreamer where to find the plugin (if installing to HOME)
+# 5. Tell GStreamer where to find the plugin
+$ export GST_PLUGIN_PATH_1_0="/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0"
+# if installing to HOME
 $ export GST_PLUGIN_PATH_1_0="$HOME/.local/lib/$(uname -m)-linux-gnu/gstreamer-1.0"
+
 
 # 6. Clear GStreamer cache
 $ rm -rf ~/.cache/gstreamer-1.0/*

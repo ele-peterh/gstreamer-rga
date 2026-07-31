@@ -51,6 +51,11 @@
 #include <gst/video/gstvideopool.h>
 #include <gst/video/video.h>
 
+#include <errno.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
+#include <time.h>
+
 #include "gstrgavideoconvert.h"  // NOLINT
 #include "rga/RgaApi.h"
 #include "rga/im2d.h"
@@ -413,6 +418,12 @@ static void gst_rga_buffer_set_geometry(rga_buffer_t *buf,
     height &= ~1;
   }
 
+  GST_LOG("pre-correction: %s %ux%u, raw plane stride %u B, pixel_stride %u B, "
+          "offset[1] %" G_GSIZE_FORMAT ", n_planes %d",
+          GST_VIDEO_INFO_NAME(info), width, height, hstride, pixel_stride,
+          GST_VIDEO_INFO_N_PLANES(info) > 1 ? GST_VIDEO_INFO_PLANE_OFFSET(info, 1) : (gsize)0,
+          GST_VIDEO_INFO_N_PLANES(info));
+
   if (hstride / pixel_stride >= width) hstride /= pixel_stride;
 
   buf->width = width;
@@ -478,7 +489,90 @@ typedef struct {
   rga_buffer_t buf;
   GstVideoFrame frame;
   gboolean mapped;
+  /* >= 0 when this surface is an imported DMABuf: the fd to bracket with
+   * DMA_BUF_IOCTL_SYNC on close, matching the START sync done on open. */
+  gint dmabuf_fd;
+  gboolean dmabuf_for_write;
 } GstRgaSurface;
+
+/* Brackets RGA's access to an imported DMABuf with DMA_BUF_IOCTL_SYNC, so the
+ * kernel gets a chance to flush/invalidate caches around it. This ioctl is
+ * documented for CPU mmap access specifically, but RGA imports the fd
+ * directly rather than mmapping it - there is no standard API for "make sure
+ * a hardware-imported DMABuf is coherent". Bracketing it here anyway is a
+ * best-effort attempt to get the same cache maintenance the kernel would do
+ * for a CPU access, since the exporter's sync callback generally flushes the
+ * buffer's backing pages regardless of who is asking. Not fatal if the
+ * exporter does not support/need it. */
+static void gst_rga_dmabuf_sync(gint fd, gboolean start, gboolean for_write) {
+  struct dma_buf_sync sync = {0};
+
+  sync.flags = (start ? DMA_BUF_SYNC_START : DMA_BUF_SYNC_END) |
+              (for_write ? DMA_BUF_SYNC_WRITE : DMA_BUF_SYNC_READ);
+
+  if (ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync) < 0)
+    GST_LOG("DMA_BUF_IOCTL_SYNC(fd=%d, %s, %s) failed: %s", fd,
+            start ? "START" : "END", for_write ? "WRITE" : "READ",
+            g_strerror(errno));
+}
+
+/* Formats the current wall-clock time as HH:MM:SS.ssssss into @buf, so it can
+ * be lined up directly against `dmesg -T` timestamps when hunting for a
+ * correlation with kernel-side (e.g. uvcvideo) errors. */
+static void gst_rga_format_walltime(gchar *buf, gsize buf_size) {
+  struct timespec ts;
+  struct tm tm;
+  gsize len;
+
+  clock_gettime(CLOCK_REALTIME, &ts);
+  localtime_r(&ts.tv_sec, &tm);
+  len = strftime(buf, buf_size, "%H:%M:%S", &tm);
+  g_snprintf(buf + len, buf_size - len, ".%06ld", ts.tv_nsec / 1000);
+}
+
+/* Logs how long it has been since @fd was last imported, if ever. A gap
+ * shorter than (or close to) a frame period, or one that is wildly variable,
+ * would point at the same class of buffer-reuse race already found on the
+ * encoder's output-buffer side, just on this (input) side instead.
+ *
+ * Linear scan over a handful of slots, not fd % N: real fd values are small
+ * and easily collide under a naive modulo (e.g. 15 and 23 both %8 == 7),
+ * which would silently evict a *different* still-cycling fd's history every
+ * time instead of ever matching. */
+static void gst_rga_log_fd_reuse(GstRgaVideoConvert *rgavideoconvert,
+                                 gint fd) {
+  guint n = G_N_ELEMENTS(rgavideoconvert->fd_last_seen_fd);
+  gint64 now = g_get_monotonic_time();
+  gchar walltime[32];
+  guint i, victim = 0;
+  gint64 oldest = G_MAXINT64;
+
+  gst_rga_format_walltime(walltime, sizeof(walltime));
+
+  for (i = 0; i < n; i++) {
+    if (rgavideoconvert->fd_last_seen_fd[i] == fd) {
+      GST_LOG_OBJECT(rgavideoconvert,
+                     "wall=%s fd %d reused after %" G_GINT64_FORMAT " us",
+                     walltime, fd, now - rgavideoconvert->fd_last_seen_us[i]);
+      rgavideoconvert->fd_last_seen_us[i] = now;
+      return;
+    }
+    if (rgavideoconvert->fd_last_seen_fd[i] == -1) {
+      victim = i;
+      oldest = -1; /* free slot always wins over evicting a live one */
+    } else if (oldest != -1 && rgavideoconvert->fd_last_seen_us[i] < oldest) {
+      oldest = rgavideoconvert->fd_last_seen_us[i];
+      victim = i;
+    }
+  }
+
+  GST_LOG_OBJECT(rgavideoconvert,
+                 "wall=%s fd %d seen for the first time (evicting slot "
+                 "previously fd %d)",
+                 walltime, fd, rgavideoconvert->fd_last_seen_fd[victim]);
+  rgavideoconvert->fd_last_seen_fd[victim] = fd;
+  rgavideoconvert->fd_last_seen_us[victim] = now;
+}
 
 static gboolean gst_rga_surface_open(GstRgaVideoConvert *rgavideoconvert,
                                      GstBuffer *buffer,
@@ -488,10 +582,14 @@ static gboolean gst_rga_surface_open(GstRgaVideoConvert *rgavideoconvert,
   gint fd;
 
   *surface = (GstRgaSurface){0};
+  surface->dmabuf_fd = -1;
 
   fd = gst_rga_buffer_get_dmabuf_fd(buffer);
   if (fd >= 0) {
     GstVideoInfo dmabuf_info;
+    gboolean for_write = (map_flags & GST_MAP_WRITE) != 0;
+
+    gst_rga_log_fd_reuse(rgavideoconvert, fd);
 
     gst_rga_video_info_from_buffer(info, buffer, &dmabuf_info);
     surface->buf = wrapbuffer_fd(
@@ -499,6 +597,10 @@ static gboolean gst_rga_surface_open(GstRgaVideoConvert *rgavideoconvert,
         GST_VIDEO_INFO_HEIGHT(&dmabuf_info),
         gst_gst_format_to_rga_format(GST_VIDEO_INFO_FORMAT(&dmabuf_info)));
     gst_rga_buffer_set_geometry(&surface->buf, &dmabuf_info);
+
+    gst_rga_dmabuf_sync(fd, TRUE, for_write);
+    surface->dmabuf_fd = fd;
+    surface->dmabuf_for_write = for_write;
 
     GST_LOG_OBJECT(rgavideoconvert, "imported dmabuf fd %d", fd);
     return TRUE;
@@ -518,6 +620,47 @@ static gboolean gst_rga_surface_open(GstRgaVideoConvert *rgavideoconvert,
 static void gst_rga_surface_close(GstRgaSurface *surface) {
   if (surface->mapped) gst_video_frame_unmap(&surface->frame);
   surface->mapped = FALSE;
+
+  if (surface->dmabuf_fd >= 0)
+    gst_rga_dmabuf_sync(surface->dmabuf_fd, FALSE, surface->dmabuf_for_write);
+  surface->dmabuf_fd = -1;
+}
+
+/* (Re)allocates rgavideoconvert->scratch_buffer, tightly packed (no
+ * downstream-negotiated padding), sized/formatted for out_info. Cheap no-op
+ * once the output geometry has settled, since that only changes on
+ * renegotiation. */
+static gboolean gst_rga_video_convert_ensure_scratch(
+    GstRgaVideoConvert *rgavideoconvert, const GstVideoInfo *out_info) {
+  GstVideoInfo want;
+
+  gst_video_info_init(&want);
+  gst_video_info_set_format(&want, GST_VIDEO_INFO_FORMAT(out_info),
+                            GST_VIDEO_INFO_WIDTH(out_info),
+                            GST_VIDEO_INFO_HEIGHT(out_info));
+
+  if (rgavideoconvert->scratch_buffer != NULL &&
+      GST_VIDEO_INFO_FORMAT(&rgavideoconvert->scratch_info) ==
+          GST_VIDEO_INFO_FORMAT(&want) &&
+      GST_VIDEO_INFO_WIDTH(&rgavideoconvert->scratch_info) ==
+          GST_VIDEO_INFO_WIDTH(&want) &&
+      GST_VIDEO_INFO_HEIGHT(&rgavideoconvert->scratch_info) ==
+          GST_VIDEO_INFO_HEIGHT(&want))
+    return TRUE;
+
+  gst_buffer_replace(&rgavideoconvert->scratch_buffer, NULL);
+  rgavideoconvert->scratch_buffer =
+      gst_buffer_new_allocate(NULL, GST_VIDEO_INFO_SIZE(&want), NULL);
+  if (rgavideoconvert->scratch_buffer == NULL) {
+    GST_ERROR_OBJECT(rgavideoconvert,
+                     "failed to allocate %" G_GSIZE_FORMAT
+                     "-byte scratch buffer",
+                     GST_VIDEO_INFO_SIZE(&want));
+    return FALSE;
+  }
+
+  rgavideoconvert->scratch_info = want;
+  return TRUE;
 }
 
 static GstFlowReturn gst_rga_video_convert_run(
@@ -723,9 +866,13 @@ static void gst_rga_video_convert_init(GstRgaVideoConvert *rgavideoconvert) {}
 static gboolean gst_rga_video_convert_start(GstBaseTransform *trans) {
   GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
   guint32 core_mask;
+  guint i;
 
   GST_DEBUG_OBJECT(rgavideoconvert, "start");
   c_RkRgaInit();
+
+  for (i = 0; i < G_N_ELEMENTS(rgavideoconvert->fd_last_seen_fd); i++)
+    rgavideoconvert->fd_last_seen_fd[i] = -1;
 
   GST_OBJECT_LOCK(rgavideoconvert);
   core_mask = rgavideoconvert->core_mask;
@@ -738,6 +885,7 @@ static gboolean gst_rga_video_convert_start(GstBaseTransform *trans) {
 static gboolean gst_rga_video_convert_stop(GstBaseTransform *trans) {
   GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
   GST_DEBUG_OBJECT(rgavideoconvert, "stop");
+  gst_buffer_replace(&rgavideoconvert->scratch_buffer, NULL);
   c_RkRgaDeInit();
   return TRUE;
 }
@@ -880,7 +1028,9 @@ static GstFlowReturn gst_rga_video_convert_transform(GstBaseTransform *trans,
                                                      GstBuffer *outbuf) {
   GstRgaVideoConvert *rgavideoconvert = gst_rga_video_convert(trans);
   GstVideoFilter *filter = GST_VIDEO_FILTER(trans);
-  GstRgaSurface src, dst;
+  GstRgaSurface src;
+  GstVideoFrame scratch_frame, out_frame;
+  rga_buffer_t scratch_buf;
   GstFlowReturn ret;
 
   if (G_UNLIKELY(!filter->negotiated)) {
@@ -899,16 +1049,54 @@ static GstFlowReturn gst_rga_video_convert_transform(GstBaseTransform *trans,
                             GST_MAP_READ, &src))
     return GST_FLOW_ERROR;
 
-  if (!gst_rga_surface_open(rgavideoconvert, outbuf, &filter->out_info,
-                            GST_MAP_WRITE, &dst)) {
+  /* RGA converts into our own scratch buffer, never straight into outbuf:
+   * outbuf's memory is externally pooled, and with a small (possibly
+   * single-buffer) pool it can be the exact same physical buffer a
+   * downstream encoder's own asynchronous hardware read has not actually
+   * finished with yet, even though it already dropped its GStreamer-level
+   * ref. Keeping RGA off that shared memory removes any risk of RGA's own
+   * write racing such a read; see gstrgavideoconvert.h for the rest of the
+   * reasoning. */
+  if (!gst_rga_video_convert_ensure_scratch(rgavideoconvert,
+                                            &filter->out_info)) {
     gst_rga_surface_close(&src);
     return GST_FLOW_ERROR;
   }
 
-  ret = gst_rga_video_convert_run(rgavideoconvert, &src.buf, &dst.buf);
+  if (!gst_video_frame_map(&scratch_frame, &rgavideoconvert->scratch_info,
+                           rgavideoconvert->scratch_buffer, GST_MAP_WRITE)) {
+    GST_ERROR_OBJECT(rgavideoconvert, "failed to map scratch buffer");
+    gst_rga_surface_close(&src);
+    return GST_FLOW_ERROR;
+  }
 
-  gst_rga_surface_close(&dst);
+  scratch_buf = gst_rga_buffer_from_video_frame(&scratch_frame);
+  ret = gst_rga_video_convert_run(rgavideoconvert, &src.buf, &scratch_buf);
   gst_rga_surface_close(&src);
+
+  if (ret != GST_FLOW_OK) {
+    gst_video_frame_unmap(&scratch_frame);
+    return ret;
+  }
+
+  /* Only a plain, synchronous CPU copy - gst_video_frame_copy(), which
+   * respects each side's own strides - ever touches outbuf now, right before
+   * we hand it back. */
+  if (!gst_video_frame_map(&out_frame, &filter->out_info, outbuf,
+                           GST_MAP_WRITE)) {
+    GST_ERROR_OBJECT(rgavideoconvert, "failed to map outbuf");
+    gst_video_frame_unmap(&scratch_frame);
+    return GST_FLOW_ERROR;
+  }
+
+  if (!gst_video_frame_copy(&out_frame, &scratch_frame)) {
+    GST_ERROR_OBJECT(rgavideoconvert,
+                     "failed to copy scratch buffer into outbuf");
+    ret = GST_FLOW_ERROR;
+  }
+
+  gst_video_frame_unmap(&out_frame);
+  gst_video_frame_unmap(&scratch_frame);
 
   return ret;
 }

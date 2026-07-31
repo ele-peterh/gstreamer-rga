@@ -52,6 +52,28 @@ struct _GstRgaVideoConvert {
    * handed to RGA, so that a property change mid-stream cannot rotate a frame
    * into a buffer that was sized for the previous angle. */
   guint32 active_rotation;
+
+  /* Scratch buffer RGA converts into on the DMABuf path, instead of writing
+   * straight into the externally-pooled outbuf. Some downstream HW elements
+   * drop their reference to a buffer as soon as it is submitted to hardware,
+   * before their own asynchronous read of it has actually finished - with a
+   * single-buffer pool that means the very next outbuf we are handed can be
+   * the same physical memory a downstream encoder may still be reading. RGA
+   * (which may itself complete asynchronously relative to improcess()
+   * returning) is kept off that shared memory entirely; only a plain,
+   * synchronous CPU copy (gst_video_frame_copy) ever touches outbuf, right
+   * before we return. Only used from the streaming thread, so unlike
+   * core_mask/flip/rotation this needs no lock. */
+  GstBuffer *scratch_buffer;
+  GstVideoInfo scratch_info;
+
+  /* Debug: how recently each currently-cycling DMABuf fd was last imported,
+   * to check for a suspiciously tight reuse cadence (the same class of race
+   * already found on the encoder's output-buffer side). Indexed by
+   * fd % G_N_ELEMENTS(...); good enough for the handful of buffers a v4l2
+   * capture pool actually cycles through. -1 in fd_last_seen_fd means unset. */
+  gint64 fd_last_seen_us[8];
+  gint fd_last_seen_fd[8];
 };
 
 struct _GstRgaVideoConvertClass {
